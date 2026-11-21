@@ -97,6 +97,7 @@ from app.services.query_audit import QueryAuditService
 from app.services.cost_govern import CostGovernService
 from app.services.data_contract import DataContractService
 from app.services.semantic_model import SemanticModelService
+from app.services.promotion_confirm_batch import PromotionConfirmBatchService
 
 source_svc = SourceRegistryService()
 semantic_svc = SemanticModelService()
@@ -110,6 +111,7 @@ rewrite_svc = QueryRewriteService()
 audit_svc = QueryAuditService()
 cost_svc = CostGovernService()
 contract_svc = DataContractService()
+promotion_batch_svc = PromotionConfirmBatchService()
 
 
 @router.post("/pipelines/source-to-federated")
@@ -221,3 +223,39 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 投产映射确认批：模型投产 × 数据契约的幂等确认 / 消费 / 还原 / 对账 --
+
+@router.post("/pipelines/promotion-confirm/submit")
+def pipeline_promotion_confirm_submit(
+    model_id: int = Query(...), contract_id: int = Query(...),
+) -> dict[str, Any]:
+    """一次性读取完整映射与契约快照，建立（或回放）投产映射确认批次。"""
+    return promotion_batch_svc.submit_confirmation(model_id, contract_id)
+
+
+@router.post("/pipelines/promotion-confirm/{batch_id}/reenter")
+def pipeline_promotion_confirm_reenter(batch_id: int) -> dict[str, Any]:
+    """失败批次重新进入：同批续跑，不产生半更新、不新增确认结果。"""
+    return promotion_batch_svc.reenter_confirmation(batch_id)
+
+
+@router.get("/pipelines/promotion-confirm/reconcile")
+def pipeline_promotion_confirm_reconcile(
+    model_id: int = Query(...), contract_id: int = Query(...),
+) -> dict[str, Any]:
+    """并发操作后刷新模型与契约，核对版本、字段与使用中的数据口径。"""
+    return promotion_batch_svc.refresh_and_reconcile(model_id, contract_id)
+
+
+@router.get("/pipelines/promotion-confirm/{batch_id}")
+def pipeline_promotion_confirm_detail(batch_id: int) -> dict[str, Any]:
+    """读取批次完整快照与约束版本，可还原当时确认的映射 × 契约组合。"""
+    return promotion_batch_svc.get_batch_detail(batch_id)
+
+
+@router.post("/pipelines/promotion-confirm/{batch_id}/consume")
+def pipeline_promotion_confirm_consume(batch_id: int) -> dict[str, Any]:
+    """数据契约消费确认批：生成可校验约束版本并回写发布清单。"""
+    return contract_svc.consume_confirmation_batch(batch_id)

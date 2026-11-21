@@ -24,6 +24,7 @@ from app.services.data_lake_read import DataLakeReadService
 from app.services.result_cache import ResultCacheService
 from app.services.data_contract import DataContractService
 from app.services.ab_config import AbConfigService
+from app.services.promotion_confirm_batch import PromotionConfirmBatchService
 
 SERVICES: dict[str, BaseModuleService] = {
     "source_registry": SourceRegistryService(),
@@ -48,6 +49,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "result_cache": ResultCacheService(),
     "data_contract": DataContractService(),
     "ab_config": AbConfigService(),
+    "promotion_confirm_batch": PromotionConfirmBatchService(),
 }
 
 

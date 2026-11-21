@@ -71,7 +71,28 @@ npm run dev
 | 湖仓读取 | `data_lake_read` | 湖仓路径 | 路径编号、存储位置、文件格式 |
 | 结果缓存 | `result_cache` | 缓存条目 | 条目编号、查询摘要、结果哈希 |
 | 数据契约 | `data_contract` | 契约定义 | 契约编号、数据集、Schema约束 |
+| 投产映射确认批次 | `promotion_confirm_batch` | 投产确认批 | 批次编号、模型/契约指纹、幂等键、确认结果 |
 | 实验配置 | `ab_config` | AB实验 | 实验编号、实验名称、分流比例 |
+
+## 投产映射确认批次
+
+语义模型投产与数据契约更新原先各自读取源表映射 / 契约字段变更记录再分别回写，存在重复取数和
+口径漂移。现在统一收敛为「投产映射确认批次」（`promotion_confirm_batch`）：
+
+- `POST /api/pipelines/promotion-confirm/submit?model_id=&contract_id=`：一次性读取模型完整
+  映射快照（源字段、字段别名、聚合定义）与契约完整列定义快照，计算双方指纹并幂等确认；
+  同一幂等键重复提交只保留一个确认结果，失败批次可重新进入，无半更新定义。
+- `POST /api/pipelines/promotion-confirm/{batch_id}/reenter`：失败批次重新进入，同批续跑。
+- `GET  /api/pipelines/promotion-confirm/{batch_id}`：返回完整快照与约束版本，可还原当时
+  确认的映射 × 契约组合。
+- `POST /api/pipelines/promotion-confirm/{batch_id}/consume`：数据契约从确认批消费真实模型
+  映射，生成可校验约束版本（`contract_constraint_version`），并把状态结果回写发布清单
+  （`result_mart`）；契约字段切换只写 `contract_field_change`，不再原地改写模型字段。
+- `GET  /api/pipelines/promotion-confirm/reconcile?model_id=&contract_id=`：并发操作后刷新
+  模型与契约，核对版本、字段与使用中的数据口径是否对得上。
+
+确认与消费共享 `CONFIRM_LOCK`，快照只冻结业务定义（不含 status 等运行态字段），兼容无版本
+序号的历史模型与无约束版本字段的历史契约。
 
 ## 约定
 

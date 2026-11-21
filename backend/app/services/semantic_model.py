@@ -1,11 +1,15 @@
-"""语义模型领域服务：管理表映射、字段别名、度量定义与计算口径，作为查询翻译层。"""
+"""语义模型领域服务：管理表映射、字段别名、度量定义与计算口径，作为查询翻译层。
+
+改造要点：投产校验不再自行重复读取源表 / 契约并分别回写，而是统一委托给
+``PromotionConfirmBatchService`` —— 一次读取完整映射快照（源字段、别名、聚合定义）
+与契约快照，由确认批完成幂等校验、原子投产与可还原留痕。
+"""
 from __future__ import annotations
 
-import time
-import uuid
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.promotion_confirm_batch import PromotionConfirmBatchService
 from app.store import store
 
 
@@ -19,64 +23,39 @@ class SemanticModelService(BaseModuleService):
     ACTION_RULES = {"提交校验": "校验中", "投产模型": "已投产", "废弃模型": "已废弃"}
     NEGATIVE_ACTIONS = []
 
-    def validate_and_promote(self, model_id: int) -> dict[str, Any]:
-        """校验语义模型并投产：验证源表映射、字段别名与度量定义。
+    def __init__(self) -> None:
+        self._batch_service = PromotionConfirmBatchService()
 
-        跨模块数据流：
-        - 读取 source_registry 校验源表是否存在
-        - 读取 query_rewrite 获取可用的改写规则
-        - 写入数据契约作为Schema承诺
-        - 写入审计日志
+    def validate_and_promote(self, model_id: int, contract_id: int | None = None) -> dict[str, Any]:
+        """校验语义模型并投产（兼容旧入口）。
+
+        新数据流：
+        - 一次性读取模型完整映射快照（源字段、字段别名、聚合定义）与数据契约快照；
+        - 提交投产映射确认批，由批次完成幂等校验与原子投产；
+        - 未显式指定契约时，按数据集 / 模型名称匹配一份候选契约，保持历史调用可用。
         """
         model = store.find(self.MODULE, model_id)
         if model is None:
             return {"ok": False, "message": "语义模型不存在"}
 
-        source_ref = model.get("源表映射", "")
-        validation_issues = []
-
-        # 校验源表是否存在
-        if "source_registry" in source_ref:
-            sources = store.rows("source_registry")
-            related = [s for s in sources if str(s.get("id")) in source_ref]
-            if not related:
-                validation_issues.append("关联的数据源不存在或已停用")
-
-        # 校验字段别名不为空
-        aliases = model.get("字段别名", "")
-        if not aliases.strip() or aliases.strip() == ",":
-            validation_issues.append("字段别名不能为空")
-
-        # 校验度量定义
-        measure = model.get("度量定义", "")
-        if not measure.strip():
-            validation_issues.append("度量定义不能为空")
-
-        if validation_issues:
-            model["status"] = "已废弃"
-            model["abnormal"] = True
+        target_contract_id = contract_id or self._resolve_contract_id(model)
+        if target_contract_id is None:
             return {
                 "ok": False,
-                "message": f"校验失败: {'; '.join(validation_issues)}",
-                "issues": validation_issues,
+                "message": "未找到可配对的数据契约，请显式传入 contract_id 后再投产",
             }
 
-        # 通过校验，投产模型
-        model["status"] = "已投产"
-        model["pending"] = False
-
-        # 更新数据契约
-        _update_contract_on_promotion(model)
-
-        # 写入审计
-        _audit_promotion(model_id, model.get("模型编号", ""))
-
-        return {
-            "ok": True,
-            "model_id": model_id,
-            "status": "已投产",
-            "fields_count": len(aliases.split(",")),
-        }
+        result = self._batch_service.submit_confirmation(model_id, target_contract_id)
+        # 兼容旧返回结构
+        if result.get("ok"):
+            result["model_id"] = model_id
+            result["status"] = "已投产"
+        else:
+            failed = store.find(self.MODULE, model_id)
+            if failed is not None:
+                failed["status"] = "已废弃"
+                failed["abnormal"] = True
+        return result
 
     def detect_schema_conflicts(self, source_id: int) -> dict[str, Any]:
         """检测数据源Schema变化与已投产语义模型之间的冲突。
@@ -118,30 +97,16 @@ class SemanticModelService(BaseModuleService):
             "conflicts": conflicts,
         }
 
-
-def _update_contract_on_promotion(model: dict[str, Any]) -> None:
-    contracts = store.rows("data_contract")
-    for c in contracts:
-        if c.get("status") == "草稿" and model.get("模型名称", "") in str(c.get("数据集", "")):
-            c["Schema约束"] = model.get("字段别名", "")
-            c["status"] = "已承诺"
-
-
-def _audit_promotion(model_id: int, model_no: str) -> None:
-    rows = store.rows("query_audit")
-    audit_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
-    audit = {
-        "id": audit_id,
-        "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
-        "查询语句": f"SEMANTIC_PROMOTE model={model_no}",
-        "执行耗时": "200ms",
-        "扫描行数": "1",
-        "返回行数": "1",
-        "数据来源": "semantic_model",
-        "操作用户": "validator",
-        "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status": "正常",
-        "pending": False,
-        "abnormal": False,
-    }
-    rows.append(audit)
+    def _resolve_contract_id(self, model: dict[str, Any]) -> int | None:
+        """历史调用未指定契约时的配对规则：模型名称命中数据集，优先取未终止契约。"""
+        contracts = store.rows("data_contract")
+        model_name = str(model.get("模型名称", ""))
+        source_ref = str(model.get("源表映射", ""))
+        candidates = [
+            c for c in contracts
+            if model_name in str(c.get("数据集", ""))
+            or str(c.get("数据集", "")) in source_ref
+            or source_ref in str(c.get("数据集", ""))
+        ]
+        candidates.sort(key=lambda c: c.get("status") == "已终止")
+        return int(candidates[0]["id"]) if candidates else None
